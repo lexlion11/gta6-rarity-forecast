@@ -11,7 +11,7 @@
 //      no trend information — every read of it is the same page, duplicated).
 //   2. Median. Two trend extrapolations of logit(rate), averaged and shrunk toward
 //      persistence by how many refresh states were observed:
-//      A) a line of logit(rate) against hours, its slope damped by 1/(1 + 0.4 dt/span)
+//      A) a line of logit(rate) against hours, its slope damped by span/(span+dt)
 //         because progression slows as the launch burst passes;
 //      B) a line of logit(rate) against ln(1 + hours since release), read at the target —
 //         the penetration-curve view, which decelerates in time by construction.
@@ -78,15 +78,21 @@ interface State {
 }
 
 const clamp = (x: number, lo: number, hi: number): number => Math.min(hi, Math.max(lo, x));
+
 const logitOf = (pct: number): number => {
   const p = clamp(pct, 0.01, 99.99);
   return Math.log(p / (100 - p));
 };
+
 const sigmoidPct = (x: number): number => 100 / (1 + Math.exp(-x));
-/** x rounded to 4 decimals. */
+
+/** x rounded to 4 decimals (matches the house baseline's output precision). */
 const round4 = (x: number): number => Math.round(x * 10_000) / 10_000;
 
-/** Least squares y = a + b x. Returns [intercept, slope, residual std] (residual std 0 when n < 3). */
+/**
+ * Least squares y = a + b x over the given points.
+ * Returns [intercept, slope, residual std]; residual std is 0 when n < 3.
+ */
 function lsq(xs: number[], ys: number[]): [number, number, number] {
   const n = xs.length;
   if (n === 0) return [Number.NaN, Number.NaN, 0];
@@ -117,6 +123,7 @@ function lsq(xs: number[], ys: number[]): [number, number, number] {
   return [a, b, Math.sqrt(ss / Math.max(1, n - 2))];
 }
 
+/** Two rate vectors are the same page state iff every entry (nulls included) matches. */
 const sameRates = (a: Array<number | null>, b: Array<number | null>): boolean => {
   if (a.length !== b.length) return false;
   for (let i = 0; i < a.length; i++) {
@@ -172,7 +179,8 @@ function forecastCase(c: CaseFile): Array<{ id: number; q: number[] }> {
     1,
     (tLast - (flat ? states[0].t : states[firstChange].t)) / 3_600_000,
   );
-  const HTarget = Math.max(0, (tTarget - tRelease) / 3_600_000);
+  const hTarget = Math.max(0, (tTarget - tRelease) / 3_600_000);
+  const hLast = Math.max(0, (tLast - tRelease) / 3_600_000);
 
   // Launch-night prior (flat history): the rules' documented launch-night refresh took
   // the tracked base from 638 to 3,868 players; earners grow, but by less.
@@ -188,6 +196,7 @@ function forecastCase(c: CaseFile): Array<{ id: number; q: number[] }> {
     let sigma: number;
 
     if (flat) {
+      // Dilution prior: earners grow ~2.2x while the tracked base grows ~6.06x.
       const rf = clamp((rL * FLAT_G_E) / FLAT_G_P, 0.01, 99.99);
       med = logitOf(rf);
       sigma = 0.65;
@@ -198,11 +207,11 @@ function forecastCase(c: CaseFile): Array<{ id: number; q: number[] }> {
         .map((s) => ({ t: s.t, r: s.rates[i] as number }));
       const n = pts.length;
       const logitL = logitOf(rL);
+
       // Damping shared by both trends: a penetration curve decelerates, so the change
       // projected past the last read is a fraction of the change observed over the
-      // span — the further the target, the smaller the fraction (span/(span+dt)).
+      // span — the further the target, the smaller the fraction.
       const g = spanH / (spanH + dtH);
-      const HLast = Math.max(0, (tLast - tRelease) / 3_600_000);
 
       // A) logit(rate) against hours: the fitted slope, damped and anchored at the last read.
       let cA = logitL;
@@ -218,13 +227,11 @@ function forecastCase(c: CaseFile): Array<{ id: number; q: number[] }> {
       let cB = logitL;
       let rho = 0.08;
       if (n >= 2) {
-        const xs = pts.map((p) =>
-          Math.log(1 + Math.max(0, (p.t - tRelease) / 3_600_000)),
-        );
+        const xs = pts.map((p) => Math.log(1 + Math.max(0, (p.t - tRelease) / 3_600_000)));
         const ys = pts.map((p) => logitOf(p.r));
         const [, bB, rB] = lsq(xs, ys);
         if (Number.isFinite(bB)) {
-          cB = logitL + bB * (Math.log(1 + HTarget) - Math.log(1 + HLast)) * g;
+          cB = logitL + bB * (Math.log(1 + hTarget) - Math.log(1 + hLast)) * g;
           rho = Math.max(rB, 0.06);
         }
       }
@@ -262,10 +269,7 @@ const inputs = readdirSync(INPUT_DIR).filter((f) => f.endsWith('.in')).sort();
 for (const file of inputs) {
   const id = file.slice(0, -'.in'.length);
   const c = JSON.parse(readFileSync(join(INPUT_DIR, file), 'utf8')) as CaseFile;
-  if (
-    c.levels.length !== LEVELS.length ||
-    c.levels.some((t, j) => t !== LEVELS[j])
-  ) {
+  if (c.levels.length !== LEVELS.length || c.levels.some((t, j) => t !== LEVELS[j])) {
     throw new Error(
       `${file} asks for levels ${JSON.stringify(c.levels)}, not ${JSON.stringify(LEVELS)}`,
     );
