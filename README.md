@@ -1,85 +1,87 @@
-# GTA VI Trophy Earn-Rate Forecast — make.fun gta6-trophy-rarity-forecast-01 entry
+# GTA VI Trophy Rarity Forecast
 
-Forecasts each GTA VI PS5 trophy's Exophase earn rate (the percent of tracked players who
-have earned it) at a future target time, as five quantiles: 0.05, 0.25, 0.5, 0.75, 0.95.
+Entry for the [make.fun](https://make.fun) **gta6-trophy-rarity-forecast-01** bounty:
+forecast the Exophase earn rate (percent of tracked players who earned each
+trophy) for every PlayStation 5 trophy of Grand Theft Auto VI at
+2026-11-26T00:00:00Z, as five quantiles (5%, 25%, 50%, 75%, 95%).
 
 ## What it does
 
-`main.ts` (Node 22, standard library only, no network) reads every `*.in` case file from
-`$MAKEFUN_INPUT_DIR` (or `/input/`) and writes one `<id>.out` per case to
-`$MAKEFUN_OUTPUT_DIR` (or `/output/`):
+`node main.ts` reads every `*.in` case file from `$MAKEFUN_INPUT_DIR`
+(default `/input/`) and writes one `<id>.out` per case to
+`$MAKEFUN_OUTPUT_DIR` (default `/output/`). Each case is a JSON object with
+the trophy list and the house's recorded reads of Exophase's trophy page
+(players tracked + per-trophy earn rates, oldest first). Each output is:
 
 ```json
-{"trophies":[{"id":1,"q":[q05,q25,q50,q75,q95]}]}
+{"trophies":[{"id":1,"q":[q05,q25,q50,q75,q95]}, ...]}
 ```
 
-One row per trophy, each id once, five finite numbers in `0..100`, non-decreasing.
-
-```sh
-mkdir -p out
-MAKEFUN_INPUT_DIR=<kit>/input MAKEFUN_OUTPUT_DIR=out node main.ts
-```
-
-Deterministic: no randomness at all, no clock, no network. Two runs write byte-identical
-files (verified).
+— one row per trophy, five finite, non-decreasing numbers in 0..100.
+Deterministic (no randomness), standard library only, no network, ~0.2 s
+per run (sandbox budget: 8 s).
 
 ## The model
 
-**1. Collapse the read history into page states.** Exophase refreshes on its own schedule,
-so many reads of the same page repeat identical values. A new state starts whenever
-`players_tracked`, `trophies_earned` or any rate changes. Trends are then fit over states,
-so one unchanged page weighs one point rather than thirty.
+Everything is done in **logit space** (`logit(p) = ln(p/(1-p))`, the scale
+the pinball-loss score is computed on), per trophy, per case:
 
-**2. Find where the real data starts.** The launch-night block before Exophase's first
-refresh carries no trend information — every read of it is the same page. The first state
-that differs from the launch page is where the trend begins.
+**Model A — logit-space trend.** Between Exophase refreshes the page is
+frozen, so only reads where the rate *or* the players-tracked count changed
+carry signal. A recency-weighted (24 h half-life) least-squares line is fit
+to `logit(rate)` vs `ln(1 + hours since release)` over those refresh points
+and extrapolated to the target with **horizon damping**
+(`w = 1/(1 + Δln/2)`): adoption curves decelerate, so only a shrinking share
+of the recent trend is carried over a multi-day horizon.
 
-**3. Median: two trend views of logit(rate), averaged and shrunk toward persistence.**
+**Model B — earners/players separation.** Implied earners
+`E = rate/100 × players_tracked` are extrapolated with a damped log-linear
+growth (growth rate decaying as `1/(1 + Δt/48h)`), while `players_tracked`
+is extrapolated with a damped linear fit over its step pattern. The median
+rate is `Ê/P̂` — free of the denominator's jumps when Exophase adds players.
+B is blended 50/50 with A in logit space, capped at 1.2 logit units away
+from A so an exponential earner run-away cannot dominate the median.
 
-- **A** — a least-squares line of `logit(rate)` against hours, extrapolated from the last
-  read to the target. Its slope is damped by `span / (span + dt)`, because a penetration
-  curve decelerates: the further out the target is, the smaller a fraction of the observed
-  change carries.
-- **B** — a least-squares line of `logit(rate)` against `ln(1 + hours since release)`,
-  read at the target. This is the penetration-curve view, which decelerates in time by
-  construction.
+**Median shrinkage.** The extrapolated median is shrunk back toward the
+last-read anchor when the trend fit is noisy
+(`shrink = 1/(1 + σ_fit/0.6)`).
 
-The two are averaged and shrunk toward pure persistence by how many refresh states were
-observed (`w = clamp((n-1)/3, 0.4, 1)`): with one refresh there is little to extrapolate
-from, with several the trend deserves the weight. The median is then held inside a sane
-band around the last read.
+**Spread.** `sqrt(σ_fit² + 0.22² + (0.0042·Δt)² + (0.25·|move|)²)` in logit
+units, plus a model-disagreement term when A and B diverge, clamped to
+[0.20, 0.85]. Quantiles are `sigmoid(median + z_τ · spread)` with the
+standard normal quantiles, rounded to 4 decimals.
 
-**4. Spread.** The standard deviation combines three terms, all in logit space:
+**Launch-night dilution prior.** When the history has never seen a
+players-tracked refresh (the flat launch-night page), the median is shaded
+down 0.3 logit units and the spread set to 0.55: an Exophase refresh before
+the target dilutes every rate but the 100% one, and the pinball loss on the
+logit scale makes rare trophies matter as much as common ones.
 
-- a random-walk term, `0.26 * sqrt(horizon in days)` — narrower than the house baseline's
-  `0.5`, because the median here is a trend rather than persistence;
-- the trend fit's own residual, scaled by the extrapolation ratio `1 + dt/span`;
-- a term for how far the two trend views disagree, `0.25 * |A - B|`.
+The trophy sitting at 100% (an auto-earn) is forecast to stay at 100.
 
-It is clamped to `[0.22, 1.4]`. The quantiles are then `sigmoid(median + z * sigma)` at
-`z = [-1.645, -0.674, 0, 0.674, 1.645]`.
+## How to run
 
-**5. Launch-night prior.** When the entire history is one unchanged page, the tracked base
-is still the launch-night cohort, and the rules document what the first refresh did: 638
-tracked players became 3,868, and every rate but the 100% one fell. The model applies that
-implied dilution to the median and widens the spread to `sigma = 0.65`.
-
-**6. Already-complete trophies.** A trophy already at 100% is reported as 100% at every
-quantile.
-
-The scoring is mean pinball loss on the logit scale, where a rare trophy (1%) weighs as
-much as a common one (50%): the model therefore works entirely in logit space, and its
-spread is deliberately not narrow — a narrow spread pays for every miss on a rare trophy.
-
-## Layout
-
-```
-main.ts        entrypoint: reads the case files, forecasts each, writes <id>.out
-LICENSE        MIT
+```bash
+mkdir -p out
+MAKEFUN_INPUT_DIR=<dir with *.in case files> MAKEFUN_OUTPUT_DIR=out node main.ts
 ```
 
-## make.fun
+Node 22.18+ runs the TypeScript directly; on Node 22.6–22.17 use
+`node --experimental-strip-types main.ts`.
 
-[![make.fun](https://make.fun/badge/gta6-trophy-rarity-forecast-01.svg)](https://make.fun/c/gta6-trophy-rarity-forecast-01)
-[![rank](https://make.fun/badge/gta6-trophy-rarity-forecast-01/lexlion11/gta6-rarity-forecast/rank.svg)](https://make.fun/c/gta6-trophy-rarity-forecast-01)
-[![reward](https://make.fun/badge/gta6-trophy-rarity-forecast-01/lexlion11/gta6-rarity-forecast/reward.svg)](https://make.fun/c/gta6-trophy-rarity-forecast-01)
+## Verification
+
+- Practice cases `p00`/`p01`: valid output, 55 rows each, ids unique,
+  quantiles finite, non-decreasing, in 0..100.
+- Synthetic final case `f00`: valid output, story trophies extrapolated up
+  with damped trends, wide honest 90% bands.
+- Determinism: two runs into separate directories produce byte-identical
+  outputs (`diff -r`).
+- Runtime ~0.2 s per case (limit 8 s); output ~2.8 KB per case (limit
+  65,536 bytes).
+
+## License
+
+MIT (see `LICENSE`).
+
+[![make.fun](https://make.fun/badge/gta6-trophy-rarity-forecast-01.svg)](https://make.fun/c/gta6-trophy-rarity-forecast-01) [![rank](https://make.fun/badge/gta6-trophy-rarity-forecast-01/lexlion11/gta6-rarity-forecast/rank.svg)](https://make.fun/c/gta6-trophy-rarity-forecast-01) [![reward](https://make.fun/badge/gta6-trophy-rarity-forecast-01/lexlion11/gta6-rarity-forecast/reward.svg)](https://make.fun/c/gta6-trophy-rarity-forecast-01)
